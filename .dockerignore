@@ -1,0 +1,11 @@
+.git
+.github
+.env*
+*.md
+*.exe
+build/
+frontend/node_modules/
+frontend/dist/
+frontend/tests/
+**/*_test.go
+release/

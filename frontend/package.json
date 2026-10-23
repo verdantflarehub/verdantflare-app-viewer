@@ -1,0 +1,21 @@
+{
+  "name": "verdantflare-app-viewer-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "check": "vue-tsc --noEmit",
+    "build": "vite build && node scripts/package-dashboard.mjs",
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "vue": "3.5.30"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.4",
+    "typescript": "5.9.3",
+    "vite": "7.3.1",
+    "vue-tsc": "3.2.5"
+  }
+}
