@@ -7,6 +7,7 @@ import type {
   SetLightingPreset,
   Vec3,
 } from './set-package.ts'
+import { subdivideSceneMeshes } from './mesh-subdivision.ts'
 
 export type BrowseMode = 'orbit' | 'walk' | 'camera'
 
@@ -305,132 +306,6 @@ function compileProgram(gl: WebGL2RenderingContext, vsSource: string, fsSource: 
   return prog
 }
 
-function subdivideLargeTriangles(prim: {
-  positions: Float32Array
-  normals: Float32Array
-  uvs: Float32Array | null
-  indices: Uint32Array
-}, maxEdgeM = 14): {
-  positions: Float32Array
-  normals: Float32Array
-  uvs: Float32Array
-  indices: Uint32Array
-} {
-  const maxEdgeSq = maxEdgeM * maxEdgeM
-  const baseUvs = prim.uvs || new Float32Array((prim.positions.length / 3) * 2)
-  let needsSplit = false
-  for (let i = 0; i + 2 < prim.indices.length; i += 3) {
-    const a = prim.indices[i] * 3
-    const b = prim.indices[i + 1] * 3
-    const c = prim.indices[i + 2] * 3
-    const ab =
-      (prim.positions[b] - prim.positions[a]) ** 2 +
-      (prim.positions[b + 1] - prim.positions[a + 1]) ** 2 +
-      (prim.positions[b + 2] - prim.positions[a + 2]) ** 2
-    const bc =
-      (prim.positions[c] - prim.positions[b]) ** 2 +
-      (prim.positions[c + 1] - prim.positions[b + 1]) ** 2 +
-      (prim.positions[c + 2] - prim.positions[b + 2]) ** 2
-    const ca =
-      (prim.positions[a] - prim.positions[c]) ** 2 +
-      (prim.positions[a + 1] - prim.positions[c + 1]) ** 2 +
-      (prim.positions[a + 2] - prim.positions[c + 2]) ** 2
-    if (ab > maxEdgeSq || bc > maxEdgeSq || ca > maxEdgeSq) {
-      needsSplit = true
-      break
-    }
-  }
-  if (!needsSplit) {
-    return {
-      positions: prim.positions,
-      normals: prim.normals,
-      uvs: baseUvs,
-      indices: prim.indices,
-    }
-  }
-
-  const posArr = Array.from(prim.positions)
-  const normArr = Array.from(prim.normals)
-  const uvArr = Array.from(baseUvs)
-  let curIndices = Array.from(prim.indices)
-
-  for (let pass = 0; pass < 5; pass++) {
-    let splitCount = 0
-    const nextIndices: number[] = []
-    const midCache = new Map<string, number>()
-
-    const getMidpoint = (i0: number, i1: number): number => {
-      const k = i0 < i1 ? `${i0}_${i1}` : `${i1}_${i0}`
-      const cached = midCache.get(k)
-      if (cached !== undefined) return cached
-      const newIdx = Math.floor(posArr.length / 3)
-      const p0 = i0 * 3
-      const p1 = i1 * 3
-      posArr.push(
-        (posArr[p0] + posArr[p1]) * 0.5,
-        (posArr[p0 + 1] + posArr[p1 + 1]) * 0.5,
-        (posArr[p0 + 2] + posArr[p1 + 2]) * 0.5
-      )
-      let nx = (normArr[p0] + normArr[p1]) * 0.5
-      let ny = (normArr[p0 + 1] + normArr[p1 + 1]) * 0.5
-      let nz = (normArr[p0 + 2] + normArr[p1 + 2]) * 0.5
-      const nlen = Math.hypot(nx, ny, nz) || 1
-      normArr.push(nx / nlen, ny / nlen, nz / nlen)
-      const u0 = i0 * 2
-      const u1 = i1 * 2
-      uvArr.push((uvArr[u0] + uvArr[u1]) * 0.5, (uvArr[u0 + 1] + uvArr[u1 + 1]) * 0.5)
-      midCache.set(k, newIdx)
-      return newIdx
-    }
-
-    for (let i = 0; i + 2 < curIndices.length; i += 3) {
-      const ia = curIndices[i]
-      const ib = curIndices[i + 1]
-      const ic = curIndices[i + 2]
-      const a = ia * 3
-      const b = ib * 3
-      const c = ic * 3
-      const ab =
-        (posArr[b] - posArr[a]) ** 2 +
-        (posArr[b + 1] - posArr[a + 1]) ** 2 +
-        (posArr[b + 2] - posArr[a + 2]) ** 2
-      const bc =
-        (posArr[c] - posArr[b]) ** 2 +
-        (posArr[c + 1] - posArr[b + 1]) ** 2 +
-        (posArr[c + 2] - posArr[b + 2]) ** 2
-      const ca =
-        (posArr[a] - posArr[c]) ** 2 +
-        (posArr[a + 1] - posArr[c + 1]) ** 2 +
-        (posArr[a + 2] - posArr[c + 2]) ** 2
-      const maxSq = Math.max(ab, bc, ca)
-      if (maxSq <= maxEdgeSq) {
-        nextIndices.push(ia, ib, ic)
-        continue
-      }
-      splitCount++
-      if (ab >= bc && ab >= ca) {
-        const im = getMidpoint(ia, ib)
-        nextIndices.push(ia, im, ic, im, ib, ic)
-      } else if (bc >= ab && bc >= ca) {
-        const im = getMidpoint(ib, ic)
-        nextIndices.push(ia, ib, im, ia, im, ic)
-      } else {
-        const im = getMidpoint(ic, ia)
-        nextIndices.push(ia, ib, im, im, ib, ic)
-      }
-    }
-    curIndices = nextIndices
-    if (splitCount === 0) break
-  }
-
-  return {
-    positions: new Float32Array(posArr),
-    normals: new Float32Array(normArr),
-    uvs: new Float32Array(uvArr),
-    indices: new Uint32Array(curIndices),
-  }
-}
-
 export class GlbViewportRenderer {
   private canvas: HTMLCanvasElement
   private gl: WebGL2RenderingContext | null = null
@@ -527,6 +402,7 @@ export class GlbViewportRenderer {
   async loadScene(parsed: ParsedGlbScene, cameras: SetCamera[]): Promise<void> {
     const gl = this.gl
     if (!gl) return
+    const preparedInstances = subdivideSceneMeshes(parsed)
     this.clearSceneGpuResources()
     this.scene = parsed
     this.cameras = cameras
@@ -569,11 +445,10 @@ export class GlbViewportRenderer {
     }
 
     // Upload mesh primitives
-    for (const inst of parsed.instances) {
+    for (const inst of preparedInstances) {
       const normalMat = mat3NormalFromMat4(inst.worldMatrix)
-      for (const rawPrim of inst.primitives) {
-        if (rawPrim.positions.length === 0 || rawPrim.indices.length === 0) continue
-        const prim = subdivideLargeTriangles(rawPrim)
+      for (const prim of inst.primitives) {
+        if (prim.positions.length === 0 || prim.indices.length === 0) continue
         const vao = gl.createVertexArray()!
         gl.bindVertexArray(vao)
 
@@ -608,7 +483,7 @@ export class GlbViewportRenderer {
           vao,
           indexBuffer: idxBuf,
           indexCount: prim.indices.length,
-          materialIndex: rawPrim.materialIndex,
+          materialIndex: prim.materialIndex,
           worldMatrix: inst.worldMatrix,
           normalMatrix: normalMat,
         })
