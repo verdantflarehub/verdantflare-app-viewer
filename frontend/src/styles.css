@@ -528,6 +528,8 @@ body[data-theme="dark"] .vf-btn.primary {
 
 .film-frame {
   position: relative;
+  width: 100%;
+  min-width: 0;
   padding: 0;
   border-radius: 8px;
   overflow: hidden;
@@ -575,6 +577,7 @@ body[data-theme="dark"] .vf-btn.primary {
 
 /* ---------- Inspector (paged tabs, no scrollbar) ---------- */
 .viewer-inspector {
+  width: 368px;
   flex: 0 0 368px;
   display: flex;
   background: var(--panel);
@@ -583,7 +586,9 @@ body[data-theme="dark"] .vf-btn.primary {
 }
 
 .viewer-inspector.collapsed {
+  width: 48px;
   flex-basis: 48px;
+  box-shadow: none;
 }
 
 .inspector-rail {
@@ -642,7 +647,7 @@ body[data-theme="dark"] .vf-btn.primary {
 
 .pane-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 8px;
 }
 
@@ -723,6 +728,23 @@ body[data-theme="dark"] .vf-btn.primary {
 }
 
 /* Narrow desktops: expanded inspector overlays the stage instead of squeezing it. */
+.viewer-workspace.is-narrow .viewer-inspector {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 12;
+  box-shadow: -12px 0 30px -18px rgba(0, 0, 0, 0.35);
+}
+
+.viewer-workspace.is-narrow .viewer-inspector.collapsed {
+  box-shadow: none;
+}
+
+.viewer-workspace.is-narrow .viewport-stage {
+  margin-right: 48px;
+}
+
 @media (max-width: 1599px) {
   .viewer-inspector {
     position: absolute;
@@ -731,6 +753,10 @@ body[data-theme="dark"] .vf-btn.primary {
     bottom: 0;
     z-index: 12;
     box-shadow: -12px 0 30px -18px rgba(0, 0, 0, 0.35);
+  }
+
+  .viewer-inspector.collapsed {
+    box-shadow: none;
   }
 
   .viewport-stage {

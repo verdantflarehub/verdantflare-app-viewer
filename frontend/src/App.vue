@@ -64,8 +64,27 @@ const cameraThumbUrls = ref<Record<string, string>>({})
 const browseMode = ref<BrowseMode>('camera')
 const activeCameraId = ref<string>('')
 type InspectorTab = 'cam' | 'cast' | 'light' | 'layer' | 'shot' | 'info'
+function isNarrowDesktopViewport(): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    const outerW = window.top?.innerWidth || window.innerWidth
+    return outerW < 1600
+  } catch {
+    return window.innerWidth < 1340
+  }
+}
+
 const inspectorTab = ref<InspectorTab>('cam')
-const inspectorCollapsed = ref<boolean>(typeof window !== 'undefined' ? window.innerWidth < 1600 : false)
+const isNarrow = ref<boolean>(isNarrowDesktopViewport())
+const inspectorCollapsed = ref<boolean>(isNarrow.value)
+
+function onViewportResize(): void {
+  const narrow = isNarrowDesktopViewport()
+  if (narrow !== isNarrow.value) {
+    isNarrow.value = narrow
+    inspectorCollapsed.value = narrow
+  }
+}
 const castVisible = ref<boolean>(true)
 const showPerf = ref<boolean>(false)
 const filmPage = ref<number>(0)
@@ -938,6 +957,7 @@ watch(stageEl, el => {
   stageObserver = new ResizeObserver(entries => {
     const w = entries[0]?.contentRect.width
     if (w) stageWidth.value = w
+    onViewportResize()
   })
   stageObserver.observe(el)
 })
@@ -985,6 +1005,13 @@ onMounted(() => {
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('keyup', onKeyUp)
   window.addEventListener('pointerup', onPointerUp)
+  window.addEventListener('resize', onViewportResize)
+  try {
+    window.top?.addEventListener('resize', onViewportResize)
+  } catch {
+    // cross-origin guard
+  }
+  onViewportResize()
 
   host?.ready()
   void loadFromTarget()
@@ -1001,6 +1028,12 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('keyup', onKeyUp)
   window.removeEventListener('pointerup', onPointerUp)
+  window.removeEventListener('resize', onViewportResize)
+  try {
+    window.top?.removeEventListener('resize', onViewportResize)
+  } catch {
+    // cross-origin guard
+  }
 })
 </script>
 
@@ -1058,7 +1091,7 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <div class="viewer-workspace" :class="{ 'inspector-collapsed': inspectorCollapsed }">
+    <div class="viewer-workspace" :class="{ 'inspector-collapsed': inspectorCollapsed, 'is-narrow': isNarrow }">
       <main ref="stageEl" class="viewport-stage">
         <div class="viewport-area">
           <div
