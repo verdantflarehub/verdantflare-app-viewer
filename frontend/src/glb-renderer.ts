@@ -22,6 +22,8 @@ export interface ViewportMetrics {
 }
 
 interface GpuPrimitive {
+  nodeName: string
+  meshName: string
   vao: WebGLVertexArrayObject
   indexBuffer: WebGLBuffer
   indexCount: number
@@ -82,6 +84,7 @@ uniform vec3 uKeyLightDir;
 uniform float uExposure;
 uniform float uFogDensity;
 uniform int uClayMode;
+uniform int uIndoorTileGrid;
 
 out vec4 outColor;
 
@@ -107,26 +110,28 @@ void main() {
   float fillDot = max(dot(N, normalize(vec3(-L.x, 0.65, -L.z))), 0.0);
   float rough = clamp(uRoughness, 0.08, 1.0);
   float specPow = mix(64.0, 6.0, rough * rough);
-  float spec = pow(max(dot(N, H), 0.0), specPow) * mix(0.04, 0.65, 1.0 - rough);
+  float spec = pow(max(dot(N, H), 0.0), specPow) * mix(0.04, 0.45, 1.0 - rough);
 
-  // Subtle tile/grid micro-detail on architectural surfaces
-  float gridX = abs(fract(vWorldPos.x * 2.5) - 0.5);
-  float gridY = abs(fract(vWorldPos.y * 2.5) - 0.5);
-  float gridZ = abs(fract(vWorldPos.z * 2.5) - 0.5);
-  float grout = smoothstep(0.01, 0.03, min(min(gridX, gridY), gridZ));
-  albedo *= mix(0.88, 1.0, grout);
+  // Subtle tile/grid micro-detail only on indoor architectural sets
+  if (uIndoorTileGrid == 1) {
+    float gridX = abs(fract(vWorldPos.x * 2.5) - 0.5);
+    float gridY = abs(fract(vWorldPos.y * 2.5) - 0.5);
+    float gridZ = abs(fract(vWorldPos.z * 2.5) - 0.5);
+    float grout = smoothstep(0.01, 0.03, min(min(gridX, gridY), gridZ));
+    albedo *= mix(0.88, 1.0, grout);
+  }
 
-  vec3 ambient = albedo * uAmbientColor * (uAmbientIntensity * (0.65 + 0.35 * (N.y * 0.5 + 0.5)));
+  vec3 ambient = albedo * uAmbientColor * (uAmbientIntensity * (0.68 + 0.32 * (N.y * 0.5 + 0.5)));
   vec3 direct = (albedo * (1.0 - uMetallic * 0.5) + vec3(spec)) * uKeyLightColor * uKeyLightIntensity * ndotl;
-  vec3 fill = albedo * uAmbientColor * (0.28 * fillDot);
+  vec3 fill = albedo * uAmbientColor * (0.32 * fillDot);
 
   vec3 color = ambient + direct + fill + uEmissive;
 
   // Distance fog
   float dist = length(uCameraPos - vWorldPos);
   float fogFactor = 1.0 - exp(-dist * uFogDensity);
-  vec3 fogColor = uAmbientColor * 0.25;
-  color = mix(color, fogColor, clamp(fogFactor, 0.0, 0.78));
+  vec3 fogColor = mix(uAmbientColor * 0.25, uAmbientColor * 0.85, float(1 - uIndoorTileGrid));
+  color = mix(color, fogColor, clamp(fogFactor, 0.0, 0.65));
 
   // ACES-like exposure tone mapping + gamma
   color *= uExposure;
@@ -171,6 +176,18 @@ function mat4Perspective(fovYDeg: number, aspect: number, near: number, far: num
     0, f, 0, 0,
     0, 0, (far + near) * nf, -1,
     0, 0, 2 * far * near * nf, 0,
+  ])
+}
+
+function mat4Ortho(width: number, height: number, near: number, far: number): Float32Array {
+  const r = Math.max(0.01, width * 0.5)
+  const t = Math.max(0.01, height * 0.5)
+  const nf = 1.0 / (near - far)
+  return new Float32Array([
+    1.0 / r, 0, 0, 0,
+    0, 1.0 / t, 0, 0,
+    0, 0, 2.0 * nf, 0,
+    0, 0, (far + near) * nf, 1,
   ])
 }
 
@@ -459,6 +476,8 @@ export class GlbViewportRenderer {
         gl.bindVertexArray(null)
 
         this.gpuPrimitives.push({
+          nodeName: inst.nodeName,
+          meshName: inst.meshName,
           vao,
           indexBuffer: idxBuf,
           indexCount: prim.indices.length,
@@ -508,6 +527,12 @@ export class GlbViewportRenderer {
     cameraTarget: Vec3
     cameraUp: Vec3
     fovYDeg: number
+    projection?: 'PERSP' | 'ORTHO'
+    orthoScale?: number
+    cameraAspect?: number
+    overscanY?: number
+    hiddenObjects?: string[]
+    indoorTileGrid?: boolean
     near: number
     far: number
     preset: SetLightingPreset
@@ -545,18 +570,46 @@ export class GlbViewportRenderer {
       this.canvas.height = targetH
     }
 
+    const indoorTileGrid = params.indoorTileGrid !== false ? 1 : 0
     gl.viewport(0, 0, targetW, targetH)
     const ambRgb = hexToRgbLinear(params.preset.ambient_color)
-    gl.clearColor(ambRgb[0] * 0.14, ambRgb[1] * 0.15, ambRgb[2] * 0.14, 1.0)
+    if (indoorTileGrid === 1) {
+      gl.clearColor(ambRgb[0] * 0.14, ambRgb[1] * 0.15, ambRgb[2] * 0.14, 1.0)
+    } else {
+      gl.clearColor(
+        Math.min(0.76, ambRgb[0] * 0.88 + 0.18),
+        Math.min(0.78, ambRgb[1] * 0.88 + 0.19),
+        Math.min(0.80, ambRgb[2] * 0.88 + 0.21),
+        1.0
+      )
+    }
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
 
     const aspect = targetW / Math.max(1, targetH)
-    const proj = mat4Perspective(params.fovYDeg, aspect, Math.max(0.05, params.near), Math.max(20, params.far))
+    const overscanY = Math.max(1.0, params.overscanY ?? 1.0)
+    const camAspect = params.cameraAspect && params.cameraAspect > 0 ? params.cameraAspect : 16 / 9
+    const near = Math.max(0.05, params.near)
+    const far = Math.max(20, params.far)
+
+    let proj: Float32Array
+    if (params.projection === 'ORTHO') {
+      const oScale = Math.max(1.0, params.orthoScale ?? 24)
+      const safeFrameWorldH = oScale / camAspect
+      const canvasWorldH = safeFrameWorldH * overscanY
+      const canvasWorldW = canvasWorldH * aspect
+      proj = mat4Ortho(canvasWorldW, canvasWorldH, near, far)
+    } else {
+      const baseTanHalfY = Math.tan(((params.fovYDeg * Math.PI) / 180) * 0.5)
+      const effectiveFovYDeg = (2 * Math.atan(baseTanHalfY * overscanY) * 180) / Math.PI
+      proj = mat4Perspective(effectiveFovYDeg, aspect, near, far)
+    }
+
     const view = mat4LookAt(params.cameraPos, params.cameraTarget, params.cameraUp)
     const viewProj = mat4Multiply(proj, view)
 
     const clayMode = params.preset.id === 'wireframe-clay' ? 1 : 0
     const keyRgb = hexToRgbLinear(params.preset.key_light_color)
+    const hiddenSet = new Set(params.hiddenObjects || [])
 
     gl.useProgram(this.meshProgram)
     gl.uniformMatrix4fv(gl.getUniformLocation(this.meshProgram, 'uViewProj'), false, viewProj)
@@ -567,8 +620,12 @@ export class GlbViewportRenderer {
     gl.uniform1f(gl.getUniformLocation(this.meshProgram, 'uKeyLightIntensity'), params.preset.key_light_intensity)
     gl.uniform3fv(gl.getUniformLocation(this.meshProgram, 'uKeyLightDir'), params.preset.key_light_dir)
     gl.uniform1f(gl.getUniformLocation(this.meshProgram, 'uExposure'), params.preset.exposure)
-    gl.uniform1f(gl.getUniformLocation(this.meshProgram, 'uFogDensity'), params.preset.fog_density ?? 0.015)
+    gl.uniform1f(
+      gl.getUniformLocation(this.meshProgram, 'uFogDensity'),
+      indoorTileGrid === 1 ? (params.preset.fog_density ?? 0.015) : 0.0012
+    )
     gl.uniform1i(gl.getUniformLocation(this.meshProgram, 'uClayMode'), clayMode)
+    gl.uniform1i(gl.getUniformLocation(this.meshProgram, 'uIndoorTileGrid'), indoorTileGrid)
 
     const uModelLoc = gl.getUniformLocation(this.meshProgram, 'uModel')
     const uNormLoc = gl.getUniformLocation(this.meshProgram, 'uNormalMatrix')
@@ -581,6 +638,12 @@ export class GlbViewportRenderer {
 
     let drawCalls = 0
     for (const prim of this.gpuPrimitives) {
+      if (hiddenSet.has(prim.nodeName) || hiddenSet.has(prim.meshName)) {
+        continue
+      }
+      if (params.showHelpers && prim.nodeName.startsWith('GUIDE_')) {
+        continue
+      }
       const mat: GlbMaterialInfo = this.scene.materials[prim.materialIndex] || this.scene.materials[0]
       if (mat.doubleSided) {
         gl.disable(gl.CULL_FACE)
@@ -648,6 +711,11 @@ export class GlbViewportRenderer {
     cameraTarget: Vec3
     cameraUp: Vec3
     fovYDeg: number
+    projection?: 'PERSP' | 'ORTHO'
+    orthoScale?: number
+    cameraAspect?: number
+    hiddenObjects?: string[]
+    indoorTileGrid?: boolean
     near: number
     far: number
     preset: SetLightingPreset
@@ -661,6 +729,7 @@ export class GlbViewportRenderer {
 
     this.renderFrame({
       ...params,
+      overscanY: 1.0,
       showHelpers: false,
       overrideWidth: capW,
       overrideHeight: capH,

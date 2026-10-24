@@ -22,6 +22,9 @@ export interface SetCamera {
   blender_name: string
   label: string
   role: 'production' | 'overview' | 'detail'
+  projection?: 'PERSP' | 'ORTHO'
+  ortho_scale?: number
+  hide_objects?: string[]
   shot_ref?: string
   position: Vec3
   target: Vec3
@@ -330,12 +333,19 @@ export function validateSetManifest(raw: unknown): SetPackageManifest {
 
     const shotsArr = Array.isArray(cam.shots) ? cam.shots.map(String) : []
     const shotRef = typeof cam.shot_ref === 'string' ? cam.shot_ref : shotsArr.join(' / ')
+    const hideObjects = Array.isArray(cam.hide_objects)
+      ? cam.hide_objects.map(String).filter(Boolean)
+      : []
+    const orthoScale = isOrtho ? Number(cam.ortho_scale ?? 24) : undefined
 
     normCameras.push({
       id,
       blender_name: String(cam.blender_name || cam.object_name || id),
       label: String(cam.label || id),
       role,
+      projection: isOrtho ? 'ORTHO' : 'PERSP',
+      ortho_scale: orthoScale,
+      hide_objects: hideObjects,
       shot_ref: shotRef || undefined,
       position: pos,
       target,
@@ -450,6 +460,8 @@ export function validateSetManifest(raw: unknown): SetPackageManifest {
   const blendSha =
     typeof doc.source_blend_sha256 === 'string' && SHA256_RE.test(doc.source_blend_sha256)
       ? doc.source_blend_sha256
+      : typeof sourceObj.blend_sha256 === 'string' && SHA256_RE.test(sourceObj.blend_sha256)
+      ? sourceObj.blend_sha256
       : normFiles['scene.glb'].sha256
 
   return {

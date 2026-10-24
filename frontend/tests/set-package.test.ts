@@ -23,7 +23,12 @@ import {
 
 const SAW_PKG_DIR = resolve(
   import.meta.dirname,
-  '../../../.output/video/saw-bathroom-promo/set-package/saw-bathroom-v9'
+  '../../../verdantflare-design/.output/video/saw-bathroom-promo/set-package/saw-bathroom-v9'
+)
+
+const ANXI_PKG_DIR = resolve(
+  import.meta.dirname,
+  '../../../verdantflare-design/.output/video/anxi-whip-inspector/blender-20261024/candidates/pkg-b'
 )
 
 test('Real T2.2 Saw Bathroom Set Package (set.json + scene.glb) passes manifest & GLB parser validation', async () => {
@@ -49,6 +54,28 @@ test('Real T2.2 Saw Bathroom Set Package (set.json + scene.glb) passes manifest 
   assert.equal(parsed.materialCount, 29)
   assert.equal(parsed.textureCount, 5)
   assert.equal(parsed.textures.length, 5)
+})
+
+test('Real Anxi Street Set Package (pkg-b) preserves source.blend_sha256, hide_objects, and ORTHO camera', async () => {
+  const rawSetJson = await readFile(resolve(ANXI_PKG_DIR, 'set.json'), 'utf8')
+  const manifest = validateSetManifest(JSON.parse(rawSetJson))
+  assert.equal(manifest.set_id, 'pkg-b')
+  assert.equal(
+    manifest.source_blend_sha256,
+    '6bd1f34634355c99eb8cf2b84dd5b51cf6a6dbd25e14e34a9796d5bf606ac9f7'
+  )
+  assert.equal(manifest.cameras.length, 7)
+
+  const gateFront = manifest.cameras.find(c => c.id === 'gate_front')
+  assert.ok(gateFront)
+  assert.equal(gateFront.projection, 'PERSP')
+  assert.deepEqual(gateFront.hide_objects, ['GUIDE_diagnostic__ink', 'GUIDE_diagnostic__marker'])
+
+  const topCam = manifest.cameras.find(c => c.id === 'top')
+  assert.ok(topCam)
+  assert.equal(topCam.projection, 'ORTHO')
+  assert.equal(topCam.ortho_scale, 245)
+  assert.deepEqual(topCam.hide_objects, [])
 })
 
 test('Viewer route parser and deep-link builder support ?cam= and #cam= and renderer=webgl2', () => {

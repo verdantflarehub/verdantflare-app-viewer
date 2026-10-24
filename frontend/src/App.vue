@@ -82,6 +82,7 @@ const walkPitch = ref<number>(0)
 const activeKeys = new Set<string>()
 
 const canvasEl = ref<HTMLCanvasElement | null>(null)
+const safeFrameBoxEl = ref<HTMLElement | null>(null)
 let renderer: GlbViewportRenderer | null = null
 let rafId = 0
 let lastTickMs = 0
@@ -579,11 +580,36 @@ function startRenderLoop(): void {
     }
     if (renderer && viewState.value === 'ready') {
       const pose = currentPose.value
+      const cam = browseMode.value === 'camera' ? activeCamera.value : null
+      const camAspect = cam?.aspect_ratio && cam.aspect_ratio > 0 ? cam.aspect_ratio : 16 / 9
+      let overscanY = 1.0
+      if (cam && canvasEl.value) {
+        const cW = canvasEl.value.clientWidth || 1280
+        const cH = canvasEl.value.clientHeight || 720
+        const measuredBoxH = safeFrameBoxEl.value?.clientHeight || 0
+        if (measuredBoxH > 20) {
+          overscanY = Math.max(1.0, cH / measuredBoxH)
+        } else {
+          const wrapW = Math.max(100, cW - 56)
+          const wrapH = Math.max(100, cH - 56)
+          const boxH = Math.min(wrapH, wrapW / camAspect)
+          overscanY = Math.max(1.0, cH / Math.max(1, boxH))
+        }
+      }
+      const isIndoor = manifest.value
+        ? Math.max(manifest.value.bounds.size[0], manifest.value.bounds.size[2]) <= 25
+        : true
       metrics.value = renderer.renderFrame({
         cameraPos: pose.position,
         cameraTarget: pose.target,
         cameraUp: pose.up,
         fovYDeg: pose.fovY,
+        projection: cam?.projection || 'PERSP',
+        orthoScale: cam?.ortho_scale,
+        cameraAspect: camAspect,
+        overscanY,
+        hiddenObjects: cam ? cam.hide_objects || [] : [],
+        indoorTileGrid: isIndoor,
         near: pose.near,
         far: pose.far,
         preset: activePreset.value,
@@ -725,17 +751,25 @@ async function copyDeepLink(): Promise<void> {
 async function takeCleanScreenshot(): Promise<void> {
   if (!renderer || !manifest.value) return
   const pose = currentPose.value
+  const cam = browseMode.value === 'camera' ? activeCamera.value : null
+  const camAspect = cam?.aspect_ratio && cam.aspect_ratio > 0 ? cam.aspect_ratio : 16 / 9
+  const isIndoor = Math.max(manifest.value.bounds.size[0], manifest.value.bounds.size[2]) <= 25
   const camId = browseMode.value === 'camera' ? activeCameraId.value : browseMode.value.toUpperCase()
   const shot = await renderer.captureCleanScreenshot({
     cameraPos: pose.position,
     cameraTarget: pose.target,
     cameraUp: pose.up,
     fovYDeg: pose.fovY,
+    projection: cam?.projection || 'PERSP',
+    orthoScale: cam?.ortho_scale,
+    cameraAspect: camAspect,
+    hiddenObjects: cam ? cam.hide_objects || [] : [],
+    indoorTileGrid: isIndoor,
     near: pose.near,
     far: pose.far,
     preset: activePreset.value,
     width: 1920,
-    height: 1080,
+    height: Math.round(1920 / camAspect),
   })
   const title = `${manifest.value.title} · ${camId} · ${activePreset.value.label}`
   const item: CapturedShot = {
@@ -1017,28 +1051,35 @@ onBeforeUnmount(() => {
             @wheel.prevent="onWheel"
           />
 
-          <!-- Optional Blender Reference Render Overlay for Alignment Inspection -->
-          <img
-            v-if="browseMode === 'camera' && overlayEnabled && activeReferenceUrl"
-            :src="activeReferenceUrl"
-            alt="Blender Reference Render"
-            class="reference-overlay-img"
-            :style="{ opacity: overlayOpacity }"
-            data-testid="reference-overlay-img"
-          >
-
-          <!-- 16:9 Safe Frame when locked to a Blender Camera -->
+          <!-- Safe Frame when locked to a Blender Camera (with exact 1:1 Reference Render Overlay) -->
           <div
             v-if="browseMode === 'camera' && activeCamera"
             class="safe-frame-wrap"
             data-testid="safe-frame"
           >
-            <div class="safe-frame-box">
+            <div
+              ref="safeFrameBoxEl"
+              class="safe-frame-box"
+              :style="{ aspectRatio: String(activeCamera.aspect_ratio || 16 / 9) }"
+            >
+              <img
+                v-if="overlayEnabled && activeReferenceUrl"
+                :src="activeReferenceUrl"
+                alt="Blender Reference Render"
+                class="reference-overlay-img"
+                :style="{ opacity: overlayOpacity }"
+                data-testid="reference-overlay-img"
+              >
               <div class="safe-frame-grid-h" />
               <div class="safe-frame-grid-v" />
               <div class="safe-frame-badge" data-testid="safe-frame-badge">
-                {{ activeCamera.blender_name }} · {{ activeCamera.focal_length_mm }}mm · FOV-Y
-                {{ activeCamera.fov_y_deg.toFixed(2) }}°
+                {{ activeCamera.blender_name }} ·
+                <template v-if="activeCamera.projection === 'ORTHO'">
+                  ORTHO · Scale {{ (activeCamera.ortho_scale || 24).toFixed(1) }}m
+                </template>
+                <template v-else>
+                  {{ activeCamera.focal_length_mm }}mm · FOV-Y {{ activeCamera.fov_y_deg.toFixed(2) }}°
+                </template>
                 <template v-if="activeCamera.shot_ref">
                   · {{ activeCamera.shot_ref }}
                 </template>
@@ -1224,7 +1265,12 @@ onBeforeUnmount(() => {
                 </div>
                 <div class="camera-label">{{ cam.label }}</div>
                 <div class="camera-optics">
-                  {{ cam.focal_length_mm }}mm · FOV-Y {{ cam.fov_y_deg.toFixed(2) }}°
+                  <template v-if="cam.projection === 'ORTHO'">
+                    ORTHO · Scale {{ (cam.ortho_scale || 24).toFixed(1) }}m
+                  </template>
+                  <template v-else>
+                    {{ cam.focal_length_mm }}mm · FOV-Y {{ cam.fov_y_deg.toFixed(2) }}°
+                  </template>
                   <template v-if="cam.frame_range">
                     · Fra {{ cam.frame_range[0] }}–{{ cam.frame_range[1] }}
                   </template>
