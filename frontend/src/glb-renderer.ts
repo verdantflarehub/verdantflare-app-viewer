@@ -659,6 +659,7 @@ export class GlbViewportRenderer {
     cameraAspect?: number
     overscanY?: number
     hiddenObjects?: string[]
+    hiddenPrefixes?: string[]
     indoorTileGrid?: boolean
     near: number
     far: number
@@ -737,6 +738,7 @@ export class GlbViewportRenderer {
     const clayMode = params.preset.id === 'wireframe-clay' ? 1 : 0
     const keyRgb = hexToRgbLinear(params.preset.key_light_color)
     const hiddenSet = new Set(params.hiddenObjects || [])
+    const hiddenPrefixes = params.hiddenPrefixes || []
 
     gl.useProgram(this.meshProgram)
     gl.uniformMatrix4fv(gl.getUniformLocation(this.meshProgram, 'uViewProj'), false, viewProj)
@@ -766,6 +768,9 @@ export class GlbViewportRenderer {
     let drawCalls = 0
     for (const prim of this.gpuPrimitives) {
       if (hiddenSet.has(prim.nodeName) || hiddenSet.has(prim.meshName)) {
+        continue
+      }
+      if (hiddenPrefixes.length && hiddenPrefixes.some(prefix => prim.nodeName.startsWith(prefix))) {
         continue
       }
       if (params.showHelpers && prim.nodeName.startsWith('GUIDE_')) {
@@ -842,6 +847,7 @@ export class GlbViewportRenderer {
     orthoScale?: number
     cameraAspect?: number
     hiddenObjects?: string[]
+    hiddenPrefixes?: string[]
     indoorTileGrid?: boolean
     near: number
     far: number

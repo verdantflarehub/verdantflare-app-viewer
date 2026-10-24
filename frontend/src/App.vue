@@ -63,7 +63,16 @@ const cameraThumbUrls = ref<Record<string, string>>({})
 
 const browseMode = ref<BrowseMode>('camera')
 const activeCameraId = ref<string>('')
-const cameraTab = ref<'production' | 'overview'>('production')
+type InspectorTab = 'cam' | 'cast' | 'light' | 'layer' | 'shot' | 'info'
+const inspectorTab = ref<InspectorTab>('cam')
+const inspectorCollapsed = ref<boolean>(typeof window !== 'undefined' ? window.innerWidth < 1600 : false)
+const castVisible = ref<boolean>(true)
+const showPerf = ref<boolean>(false)
+const filmPage = ref<number>(0)
+const panelCamPage = ref<number>(0)
+const stageWidth = ref<number>(1100)
+const layoutMode = ref<'document' | 'fill'>('document')
+const PANEL_CAMS_PER_PAGE = 6
 const activePresetId = ref<string>('saw-fluorescent')
 const currentFrame = ref<number>(1)
 const overlayEnabled = ref<boolean>(false)
@@ -135,12 +144,37 @@ const activePreset = computed<SetLightingPreset>(() => {
   )
 })
 
-const filteredCameras = computed<SetCamera[]>(() => {
+// Production / detail cameras first, overview & diagnostic cameras after; one ordered list for strip and panel.
+const orderedCameras = computed<SetCamera[]>(() => {
   if (!manifest.value) return []
-  if (cameraTab.value === 'production') {
-    return manifest.value.cameras.filter(c => c.role === 'production' || c.role === 'detail')
-  }
-  return manifest.value.cameras.filter(c => c.role === 'overview')
+  const rank = (c: SetCamera) => (c.role === 'overview' ? 1 : 0)
+  return [...manifest.value.cameras].sort((a, b) => rank(a) - rank(b))
+})
+
+// Canvas workbench rule (design spec §4.5): long lists page instead of scrolling.
+const filmPerPage = computed<number>(() => Math.max(3, Math.floor((stageWidth.value - 120) / 150)))
+const filmPageCount = computed<number>(() => Math.max(1, Math.ceil(orderedCameras.value.length / filmPerPage.value)))
+const filmCameras = computed<SetCamera[]>(() => {
+  const page = Math.min(filmPage.value, filmPageCount.value - 1)
+  return orderedCameras.value.slice(page * filmPerPage.value, page * filmPerPage.value + filmPerPage.value)
+})
+const panelCamPageCount = computed<number>(() => Math.max(1, Math.ceil(orderedCameras.value.length / PANEL_CAMS_PER_PAGE)))
+const panelCameras = computed<SetCamera[]>(() => {
+  const page = Math.min(panelCamPage.value, panelCamPageCount.value - 1)
+  return orderedCameras.value.slice(page * PANEL_CAMS_PER_PAGE, page * PANEL_CAMS_PER_PAGE + PANEL_CAMS_PER_PAGE)
+})
+const hasCast = computed<boolean>(() => (manifest.value?.cast.length || 0) > 0)
+
+interface LineageChip { key: 'world' | 'scene' | 'setup'; label: string; current: boolean; linkable: boolean }
+const lineageChips = computed<LineageChip[]>(() => {
+  const l = manifest.value?.lineage
+  if (!l) return []
+  const chips: LineageChip[] = []
+  if (l.world_asset) chips.push({ key: 'world', label: l.world_asset.label, current: false, linkable: Boolean(l.world_asset.id && l.world_asset.version_id) })
+  if (l.project_scene) chips.push({ key: 'scene', label: l.project_scene.label, current: false, linkable: Boolean(l.project_scene.id && l.project_scene.material_key && l.project_scene.state_key) })
+  if (l.setup) chips.push({ key: 'setup', label: l.setup.label, current: false, linkable: Boolean(l.project_scene?.id && l.setup.setup_key) })
+  if (chips.length) chips[chips.length - 1].current = true
+  return chips
 })
 
 const activeReferenceUrl = computed<string>(() => {
@@ -218,8 +252,20 @@ function clearObjectUrls(): void {
   cameraThumbUrls.value = {}
 }
 
+function currentHost() {
+  return props.host || hostProps()?.host || null
+}
+
+/** AppDashboard contract §3: set-browsing pages fill the viewport; the index page stays a scrolling document. */
+function applyHostLayout(mode: 'document' | 'fill'): void {
+  layoutMode.value = mode
+  currentHost()?.setLayout?.(mode)
+  syncHeight()
+}
+
 function syncHeight(): void {
-  const host = props.host || hostProps()?.host
+  const host = currentHost()
+  if (layoutMode.value === 'fill' && host?.setLayout) return
   host?.resize(Math.max(document.documentElement.scrollHeight, 760))
 }
 
@@ -367,14 +413,18 @@ function applyInitialManifestState(m: SetPackageManifest, requestedCamId: string
   const chosenCam = matchedCam || m.cameras.find(c => c.id === m.default_camera_id) || m.cameras[0]
   if (chosenCam) {
     activeCameraId.value = chosenCam.id
-    cameraTab.value = chosenCam.role === 'overview' ? 'overview' : 'production'
+    const idx = orderedCameras.value.findIndex(c => c.id === chosenCam.id)
+    filmPage.value = idx >= 0 ? Math.floor(idx / filmPerPage.value) : 0
+    panelCamPage.value = idx >= 0 ? Math.floor(idx / PANEL_CAMS_PER_PAGE) : 0
     currentFrame.value = chosenCam.frame_range ? chosenCam.frame_range[0] : 1
     browseMode.value = 'camera'
   }
-  const sawPreset = m.lighting_presets.find(p => p.id === 'saw-fluorescent') || m.lighting_presets[0]
-  if (sawPreset) {
-    activePresetId.value = sawPreset.id
+  const initialPreset = m.lighting_presets.find(p => p.id === 'saw-fluorescent') || m.lighting_presets[0]
+  if (initialPreset) {
+    activePresetId.value = initialPreset.id
   }
+  castVisible.value = true
+  if (!m.cast.length && inspectorTab.value === 'cast') inspectorTab.value = 'cam'
   walkPos.value = clampWalkPosition(
     m.nav.spawn_point,
     m.nav.walk_bounds_min,
@@ -394,6 +444,7 @@ async function loadFromTarget(): Promise<void> {
 
   const routeTarget = parseViewerRoute(currentRouteString(), currentBrowserHash())
   const localBase = getLocalPackageBaseUrl()
+  applyHostLayout(routeTarget.sourceKind === 'none' && !localBase ? 'document' : 'fill')
   if (localBase) {
     try {
       await loadFromLocalPackage(localBase, routeTarget.cameraId, routeTarget.rendererHint)
@@ -609,6 +660,7 @@ function startRenderLoop(): void {
         cameraAspect: camAspect,
         overscanY,
         hiddenObjects: cam ? cam.hide_objects || [] : [],
+        hiddenPrefixes: hasCast.value && !castVisible.value ? ['ACTOR_'] : [],
         indoorTileGrid: isIndoor,
         near: pose.near,
         far: pose.far,
@@ -764,6 +816,7 @@ async function takeCleanScreenshot(): Promise<void> {
     orthoScale: cam?.ortho_scale,
     cameraAspect: camAspect,
     hiddenObjects: cam ? cam.hide_objects || [] : [],
+    hiddenPrefixes: hasCast.value && !castVisible.value ? ['ACTOR_'] : [],
     indoorTileGrid: isIndoor,
     near: pose.near,
     far: pose.far,
@@ -818,13 +871,50 @@ function openCatalogItem(entry: CatalogEntry, setId: string): void {
   }
 }
 
+function openLineage(chip: LineageChip): void {
+  const l = manifest.value?.lineage
+  if (!l || !chip.linkable || chip.current) return
+  if (chip.key === 'world' && l.world_asset?.id && l.world_asset.version_id) {
+    openExternalApp('world', `/scene/${l.world_asset.id}?version=${l.world_asset.version_id}`)
+    return
+  }
+  const scene = l.project_scene
+  if (!scene?.id || !scene.material_key || !scene.state_key) return
+  const revision = scene.version_id ? `?revision=${scene.version_id}` : ''
+  const base = `/ai_short_drama/${scene.id}/materials/location/${scene.material_key}/${scene.state_key}`
+  openExternalApp('project', chip.key === 'setup' && l.setup?.setup_key ? `${base}/setups/${l.setup.setup_key}${revision}` : `${base}${revision}`)
+}
+
+function stepCamera(delta: number): void {
+  const list = orderedCameras.value
+  if (!list.length) return
+  const idx = Math.max(0, list.findIndex(c => c.id === activeCameraId.value))
+  const next = list[Math.min(list.length - 1, Math.max(0, idx + delta))]
+  if (next && next.id !== activeCameraId.value) {
+    selectCamera(next)
+    filmPage.value = Math.floor(list.indexOf(next) / filmPerPage.value)
+  }
+}
+
+function openInspector(tab: InspectorTab): void {
+  if (tab === 'cast' && !hasCast.value) return
+  inspectorTab.value = tab
+  inspectorCollapsed.value = false
+}
+
 function openExternalApp(appId: 'project' | 'world', path: string): void {
   const sdk = props.sdk || hostProps()?.sdk
   void sdk?.navigation?.openApp?.({ appId, path })
 }
 
 function onKeyDown(e: KeyboardEvent): void {
+  const tag = (e.target as HTMLElement | null)?.tagName
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return
   activeKeys.add(e.code)
+  if (viewState.value !== 'ready') return
+  if (e.key === ']') stepCamera(1)
+  else if (e.key === '[') stepCamera(-1)
+  else if (e.code === 'KeyF') showPerf.value = !showPerf.value
 }
 
 function onKeyUp(e: KeyboardEvent): void {
@@ -833,6 +923,23 @@ function onKeyUp(e: KeyboardEvent): void {
 
 watch(activePresetId, () => {
   publishPerfReport()
+})
+
+watch([filmCameras, panelCameras, inspectorTab], () => {
+  for (const cam of filmCameras.value) void ensureCameraThumbnailLoaded(cam)
+  if (inspectorTab.value === 'cam') for (const cam of panelCameras.value) void ensureCameraThumbnailLoaded(cam)
+})
+
+let stageObserver: ResizeObserver | null = null
+const stageEl = ref<HTMLElement | null>(null)
+watch(stageEl, el => {
+  stageObserver?.disconnect()
+  if (!el || typeof ResizeObserver === 'undefined') return
+  stageObserver = new ResizeObserver(entries => {
+    const w = entries[0]?.contentRect.width
+    if (w) stageWidth.value = w
+  })
+  stageObserver.observe(el)
 })
 
 onMounted(() => {
@@ -884,6 +991,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  stageObserver?.disconnect()
+  if (layoutMode.value === 'fill') currentHost()?.setLayout?.('document')
   abortController?.abort()
   cancelAnimationFrame(rafId)
   renderer?.dispose()
@@ -896,25 +1005,35 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="viewer-shell" data-testid="viewer-shell">
-    <!-- Top Bar: ClaudeStyle Breadcrumb from "片场查看器" with no back button -->
+  <div class="viewer-shell" :class="{ 'is-fill': layoutMode === 'fill' }" data-testid="viewer-shell">
+    <!-- 48px single-row top bar: breadcrumb from app name, lineage chain, actions. No back button. -->
     <header class="viewer-topbar">
-      <div class="breadcrumb-row">
+      <nav class="breadcrumb-row" aria-label="面包屑">
         <span class="breadcrumb-root">片场查看器</span>
         <template v-if="manifest">
           <span class="breadcrumb-sep">/</span>
-          <span class="breadcrumb-current" data-testid="set-title">
-            {{ manifest.title }} · {{ manifest.set_id }}
-          </span>
+          <span class="breadcrumb-current" aria-current="page" data-testid="set-title">{{ manifest.title }}</span>
         </template>
-        <span class="badge-mono">{{ sourceBadgeText }}</span>
-        <span
-          v-if="viewState === 'ready'"
-          class="badge-mono accent"
-          data-testid="renderer-backend"
-        >
-          {{ metrics.backend }}{{ metrics.fallbackActive ? ' (Fallback)' : '' }}
-        </span>
+      </nav>
+
+      <div v-if="manifest" class="lineage-row" data-testid="lineage">
+        <template v-if="lineageChips.length">
+          <template v-for="(chip, i) in lineageChips" :key="chip.key">
+            <span v-if="i > 0" class="lineage-sep" aria-hidden="true">›</span>
+            <button
+              type="button"
+              class="lineage-chip"
+              :class="{ current: chip.current }"
+              :disabled="chip.current || !chip.linkable"
+              :aria-current="chip.current ? 'page' : undefined"
+              :data-testid="`lineage-${chip.key}`"
+              @click="openLineage(chip)"
+            >
+              {{ chip.label }}
+            </button>
+          </template>
+        </template>
+        <span v-else class="lineage-chip current">{{ sourceBadgeText }}</span>
       </div>
 
       <div class="topbar-actions">
@@ -925,7 +1044,7 @@ onBeforeUnmount(() => {
           data-testid="btn-copy-deeplink"
           @click="copyDeepLink"
         >
-          {{ deepLinkCopied ? '已复制深链' : `复制深链 ?cam=${activeCameraId || 'C1'}` }}
+          {{ deepLinkCopied ? '已复制深链' : '复制深链' }}
         </button>
         <button
           v-if="viewState === 'ready'"
@@ -934,246 +1053,147 @@ onBeforeUnmount(() => {
           data-testid="btn-clean-screenshot"
           @click="takeCleanScreenshot"
         >
-          纯净截图 1080p
+          截图
         </button>
       </div>
     </header>
 
-    <!-- Main Full-Width Workspace -->
-    <div class="viewer-workspace">
-      <main class="viewport-stage">
-        <!-- Progressive Stage 1 Poster Backdrop -->
-        <div
-          v-if="posterUrl && viewState !== 'ready'"
-          class="poster-backdrop"
-          :style="{ backgroundImage: `url(${posterUrl})` }"
-        />
-
-        <!-- Loading State -->
-        <section
-          v-if="viewState === 'loading'"
-          class="state-card"
-          data-testid="state-loading"
-        >
-          <h2 class="state-title">正在装载 3D 片场包 (Stage {{ loadingStage }}/3)</h2>
-          <p class="state-desc">{{ loadingMessage }}</p>
-          <div class="progress-track">
-            <div class="progress-fill" :style="{ width: `${loadingProgress}%` }" />
-          </div>
-          <div class="badge-mono">artifact.read · SHA-256 强校验</div>
-        </section>
-
-        <!-- Empty State -->
-        <section
-          v-else-if="viewState === 'empty'"
-          class="state-card"
-          data-testid="state-empty"
-        >
-          <h2 class="state-title">选择要检视的 3D 片场包</h2>
-          <p class="state-desc">
-            片场查看器通过固定项目修订或数字世界资产版本受控加载 Set Package v1.0（glTF 2.0 + 实拍机位 + 灯光预设）。
-          </p>
-
-          <div v-if="catalogItems.length > 0" class="catalog-list">
-            <div
-              v-for="item in catalogItems"
-              :key="`${item.source_kind}-${item.project_id || item.asset_id}`"
-              class="catalog-item"
-            >
-              <div>
-                <div style="font-size: 13px; font-weight: 600">{{ item.title }}</div>
-                <div class="camera-optics">
-                  {{ item.source_kind === 'project' ? 'Project 固定修订' : 'World 资产版本' }} ·
-                  {{ item.set_ids.join(', ') }}
-                </div>
-              </div>
-              <button
-                type="button"
-                class="vf-btn primary"
-                @click="openCatalogItem(item, item.set_ids[0])"
-              >
-                打开片场
-              </button>
-            </div>
-          </div>
-
-          <div style="display: flex; gap: 8px; flex-wrap: wrap">
-            <button
-              type="button"
-              class="vf-btn primary"
-              @click="openExternalApp('project', '/ai_short_drama')"
-            >
-              前往短剧项目选择片场
-            </button>
-            <button
-              type="button"
-              class="vf-btn"
-              @click="openExternalApp('world', '/')"
-            >
-              前往数字世界资产库
-            </button>
-          </div>
-        </section>
-
-        <!-- Error State -->
-        <section
-          v-else-if="viewState === 'error'"
-          class="state-card"
-          data-testid="state-error"
-        >
-          <div class="badge-mono" style="margin-bottom: 10px; color: var(--danger)">
-            {{ errorCode || 'ERROR' }}
-          </div>
-          <h2 class="state-title">无法打开片场包</h2>
-          <p class="state-desc">{{ errorMessage }}</p>
-          <div style="display: flex; gap: 8px">
-            <button type="button" class="vf-btn primary" @click="loadFromTarget">
-              重新加载
-            </button>
-            <button
-              type="button"
-              class="vf-btn"
-              @click="openExternalApp('project', '/ai_short_drama')"
-            >
-              前往项目列表
-            </button>
-          </div>
-        </section>
-
-        <!-- Ready State: 3D Viewport Canvas + HUD + Safe Frame + Dock -->
-        <template v-if="viewState === 'ready' && manifest">
-          <canvas
-            ref="canvasEl"
-            class="viewport-canvas"
-            data-testid="viewport-canvas"
-            @pointerdown="onPointerDown"
-            @pointermove="onPointerMove"
-            @wheel.prevent="onWheel"
+    <div class="viewer-workspace" :class="{ 'inspector-collapsed': inspectorCollapsed }">
+      <main ref="stageEl" class="viewport-stage">
+        <div class="viewport-area">
+          <div
+            v-if="posterUrl && viewState !== 'ready'"
+            class="poster-backdrop"
+            :style="{ backgroundImage: `url(${posterUrl})` }"
           />
 
-          <!-- Safe Frame when locked to a Blender Camera (with exact 1:1 Reference Render Overlay) -->
-          <div
-            v-if="browseMode === 'camera' && activeCamera"
-            class="safe-frame-wrap"
-            data-testid="safe-frame"
-          >
-            <div
-              ref="safeFrameBoxEl"
-              class="safe-frame-box"
-              :style="{ aspectRatio: String(activeCamera.aspect_ratio || 16 / 9) }"
-            >
-              <img
-                v-if="overlayEnabled && activeReferenceUrl"
-                :src="activeReferenceUrl"
-                alt="Blender Reference Render"
-                class="reference-overlay-img"
-                :style="{ opacity: overlayOpacity }"
-                data-testid="reference-overlay-img"
+          <section v-if="viewState === 'loading'" class="state-card" data-testid="state-loading">
+            <h2 class="state-title">正在装载片场（{{ loadingStage }}/3）</h2>
+            <p class="state-desc">{{ loadingMessage }}</p>
+            <div class="progress-track"><div class="progress-fill" :style="{ width: `${loadingProgress}%` }" /></div>
+            <div class="badge-mono">artifact.read · SHA-256 校验</div>
+          </section>
+
+          <section v-else-if="viewState === 'empty'" class="state-card" data-testid="state-empty">
+            <h2 class="state-title">选择要检视的片场</h2>
+            <p class="state-desc">片场查看器按固定项目修订或数字世界资产版本打开片场包。</p>
+            <div v-if="catalogItems.length > 0" class="catalog-list">
+              <div
+                v-for="item in catalogItems"
+                :key="`${item.source_kind}-${item.project_id || item.asset_id}`"
+                class="catalog-item"
               >
-              <div class="safe-frame-grid-h" />
-              <div class="safe-frame-grid-v" />
-              <div class="safe-frame-badge" data-testid="safe-frame-badge">
-                {{ activeCamera.blender_name }} ·
-                <template v-if="activeCamera.projection === 'ORTHO'">
-                  ORTHO · Scale {{ (activeCamera.ortho_scale || 24).toFixed(1) }}m
-                </template>
-                <template v-else>
-                  {{ activeCamera.focal_length_mm }}mm · FOV-Y {{ activeCamera.fov_y_deg.toFixed(2) }}°
-                </template>
-                <template v-if="activeCamera.shot_ref">
-                  · {{ activeCamera.shot_ref }}
-                </template>
+                <div>
+                  <div class="catalog-title">{{ item.title }}</div>
+                  <div class="camera-optics">
+                    {{ item.source_kind === 'project' ? 'Project 固定修订' : 'World 资产版本' }} · {{ item.set_ids.join(', ') }}
+                  </div>
+                </div>
+                <button type="button" class="vf-btn primary" @click="openCatalogItem(item, item.set_ids[0])">打开片场</button>
               </div>
             </div>
-          </div>
-
-          <!-- Top-Left Real-Time Telemetry HUD -->
-          <div class="viewport-hud-top">
-            <span class="hud-pill" data-testid="hud-mode">
-              MODE: {{ browseMode.toUpperCase() }}
-            </span>
-            <span class="hud-pill" data-testid="hud-geometry">
-              NODES: {{ metrics.nodes }} · TRIS: {{ metrics.triangles.toLocaleString() }}
-            </span>
-            <span class="hud-pill" data-testid="hud-fps">
-              FPS: {{ metrics.fps }} · TTI: {{ firstScreenTtiMs }}ms
-            </span>
-            <span class="hud-pill" data-testid="hud-pos">
-              POS: ({{ currentPose.position[0].toFixed(2) }}, {{ currentPose.position[1].toFixed(2) }},
-              {{ currentPose.position[2].toFixed(2) }})m
-            </span>
-          </div>
-
-          <!-- Bottom Floating Control Dock -->
-          <div class="viewport-dock" data-testid="viewport-dock">
-            <div class="dock-group">
-              <button
-                type="button"
-                class="dock-btn"
-                :class="{ active: browseMode === 'camera' }"
-                data-testid="mode-camera"
-                @click="switchMode('camera')"
-              >
-                机位锁定 Cam
-              </button>
-              <button
-                type="button"
-                class="dock-btn"
-                :class="{ active: browseMode === 'orbit' }"
-                data-testid="mode-orbit"
-                @click="switchMode('orbit')"
-              >
-                环绕 Orbit
-              </button>
-              <button
-                type="button"
-                class="dock-btn"
-                :class="{ active: browseMode === 'walk' }"
-                data-testid="mode-walk"
-                @click="switchMode('walk')"
-              >
-                漫游 Walk (WASD)
-              </button>
+            <div class="state-actions">
+              <button type="button" class="vf-btn primary" @click="openExternalApp('project', '/ai_short_drama')">前往短剧项目</button>
+              <button type="button" class="vf-btn" @click="openExternalApp('world', '/')">前往数字世界</button>
             </div>
+          </section>
 
-            <template v-if="browseMode === 'camera' && activeCamera?.frame_range">
-              <div class="dock-divider" />
-              <div class="scrubber-row" data-testid="frame-scrubber">
-                <span>Fra {{ currentFrame }}</span>
-                <input
-                  v-model.number="currentFrame"
-                  type="range"
-                  :min="activeCamera.frame_range[0]"
-                  :max="activeCamera.frame_range[1]"
-                  step="1"
+          <section v-else-if="viewState === 'error'" class="state-card" data-testid="state-error">
+            <div class="badge-mono danger">{{ errorCode || 'ERROR' }}</div>
+            <h2 class="state-title">无法打开片场包</h2>
+            <p class="state-desc">{{ errorMessage }}</p>
+            <div class="state-actions">
+              <button type="button" class="vf-btn primary" @click="loadFromTarget">重新加载</button>
+              <button type="button" class="vf-btn" @click="openExternalApp('project', '/ai_short_drama')">前往项目列表</button>
+            </div>
+          </section>
+
+          <template v-if="viewState === 'ready' && manifest">
+            <canvas
+              ref="canvasEl"
+              class="viewport-canvas"
+              data-testid="viewport-canvas"
+              @pointerdown="onPointerDown"
+              @pointermove="onPointerMove"
+              @wheel.prevent="onWheel"
+            />
+
+            <!-- Safe frame is centred in the canvas so the overscan frustum stays 1:1 with the reference render. -->
+            <div v-if="browseMode === 'camera' && activeCamera" class="safe-frame-wrap" data-testid="safe-frame">
+              <div
+                ref="safeFrameBoxEl"
+                class="safe-frame-box"
+                :style="{ aspectRatio: String(activeCamera.aspect_ratio || 16 / 9) }"
+              >
+                <img
+                  v-if="overlayEnabled && activeReferenceUrl"
+                  :src="activeReferenceUrl"
+                  alt="Blender 基准渲染"
+                  class="reference-overlay-img"
+                  :style="{ opacity: overlayOpacity }"
+                  data-testid="reference-overlay-img"
                 >
-                <span>/{{ activeCamera.frame_range[1] }}</span>
+                <div class="safe-frame-grid-h" />
+                <div class="safe-frame-grid-v" />
               </div>
-            </template>
-
-            <div class="dock-divider" />
-
-            <div class="dock-group">
-              <button
-                v-for="preset in manifest.lighting_presets"
-                :key="preset.id"
-                type="button"
-                class="dock-btn"
-                :class="{ active: activePresetId === preset.id }"
-                :data-testid="`preset-${preset.id}`"
-                @click="activePresetId = preset.id"
-              >
-                {{ preset.label }}
-              </button>
             </div>
 
-            <template v-if="browseMode === 'camera' && activeReferenceUrl">
+            <div class="hud-chip hud-tl" data-testid="safe-frame-badge">
+              <template v-if="browseMode === 'camera' && activeCamera">
+                {{ activeCamera.id }} ·
+                <template v-if="activeCamera.projection === 'ORTHO'">ORTHO · Scale {{ (activeCamera.ortho_scale || 24).toFixed(1) }}m</template>
+                <template v-else>{{ activeCamera.focal_length_mm }}mm · FOV-Y {{ activeCamera.fov_y_deg.toFixed(2) }}°</template>
+                <template v-if="activeCamera.shot_ref"> · {{ activeCamera.shot_ref }}</template>
+              </template>
+              <template v-else>{{ browseMode === 'orbit' ? '环绕' : '漫游 WASD' }}</template>
+            </div>
+            <div v-if="showPerf" class="hud-chip hud-tr" data-testid="hud-perf">
+              {{ metrics.backend }}{{ metrics.fallbackActive ? ' (Fallback)' : '' }} · {{ metrics.fps }} fps ·
+              {{ metrics.nodes }} 节点 · {{ metrics.triangles.toLocaleString() }} 三角面
+            </div>
+
+            <div class="viewport-dock" data-testid="viewport-dock">
+              <div class="seg" role="group" aria-label="浏览模式">
+                <button type="button" :class="{ on: browseMode === 'camera' }" data-testid="mode-camera" @click="switchMode('camera')">机位锁定</button>
+                <button type="button" :class="{ on: browseMode === 'orbit' }" data-testid="mode-orbit" @click="switchMode('orbit')">环绕</button>
+                <button type="button" :class="{ on: browseMode === 'walk' }" data-testid="mode-walk" @click="switchMode('walk')">漫游</button>
+              </div>
+
+              <template v-if="browseMode === 'camera' && activeCamera?.frame_range">
+                <div class="dock-divider" />
+                <label class="scrubber-row" data-testid="frame-scrubber">
+                  <span>Fra {{ currentFrame }}</span>
+                  <input
+                    v-model.number="currentFrame"
+                    type="range"
+                    :min="activeCamera.frame_range[0]"
+                    :max="activeCamera.frame_range[1]"
+                    step="1"
+                  >
+                </label>
+              </template>
+
               <div class="dock-divider" />
-              <div class="scrubber-row">
+              <select v-model="activePresetId" class="dock-select" aria-label="灯光预设" data-testid="preset-select">
+                <option v-for="preset in manifest.lighting_presets" :key="preset.id" :value="preset.id">{{ preset.label }}</option>
+              </select>
+
+              <button
+                v-if="hasCast"
+                type="button"
+                class="dock-toggle"
+                :class="{ on: castVisible }"
+                data-testid="btn-toggle-cast"
+                @click="castVisible = !castVisible"
+              >
+                {{ castVisible ? '人物 · 显示' : '人物 · 隐藏' }}
+              </button>
+
+              <template v-if="browseMode === 'camera' && activeReferenceUrl">
                 <button
                   type="button"
-                  class="dock-btn"
-                  :class="{ active: overlayEnabled }"
+                  class="dock-toggle"
+                  :class="{ on: overlayEnabled }"
                   data-testid="btn-toggle-overlay"
                   @click="overlayEnabled = !overlayEnabled"
                 >
@@ -1182,131 +1202,162 @@ onBeforeUnmount(() => {
                 <input
                   v-if="overlayEnabled"
                   v-model.number="overlayOpacity"
+                  class="dock-range"
                   type="range"
                   min="0.1"
                   max="0.95"
                   step="0.05"
-                  style="width: 68px"
+                  aria-label="叠图透明度"
                 >
-              </div>
-            </template>
+              </template>
+              <button
+                type="button"
+                class="dock-toggle"
+                :class="{ on: showPerf }"
+                title="性能指标（F）"
+                data-testid="btn-toggle-perf"
+                @click="showPerf = !showPerf"
+              >
+                F
+              </button>
+            </div>
+          </template>
+        </div>
+
+        <!-- Camera film strip: paged, never scrolls ([ / ] switch cameras). -->
+        <div v-if="viewState === 'ready' && manifest" class="film-strip" data-testid="film-strip">
+          <button type="button" class="film-page" aria-label="上一页机位" :disabled="filmPage <= 0" @click="filmPage--">‹</button>
+          <div class="film-frames">
+            <button
+              v-for="cam in filmCameras"
+              :key="cam.id"
+              type="button"
+              class="film-frame"
+              :class="{ on: activeCameraId === cam.id && browseMode === 'camera' }"
+              :data-testid="`camera-card-${cam.id}`"
+              :title="cam.label"
+              @click="selectCamera(cam)"
+            >
+              <img v-if="cam.thumbnail && cameraThumbUrls[cam.thumbnail]" :src="cameraThumbUrls[cam.thumbnail]" alt="">
+              <span>{{ cam.id }}</span>
+            </button>
           </div>
-        </template>
+          <button type="button" class="film-page" aria-label="下一页机位" :disabled="filmPage >= filmPageCount - 1" @click="filmPage++">›</button>
+          <span class="film-count">{{ Math.min(filmPage, filmPageCount - 1) + 1 }}/{{ filmPageCount }}</span>
+        </div>
       </main>
 
-      <!-- Right Inspector Panel -->
-      <aside class="viewer-inspector" data-testid="viewer-inspector">
-        <template v-if="manifest">
-          <!-- Set Package Summary -->
-          <section class="inspector-section">
-            <div class="section-header">
-              <span class="section-title">片场工程参数</span>
-              <span class="badge-mono">1.0m 比例尺</span>
-            </div>
-            <div class="meta-grid">
-              <span class="meta-label">片场标识</span>
-              <span class="meta-val">{{ manifest.set_id }}</span>
-              <span class="meta-label">源工程哈希</span>
-              <span class="meta-val">{{ manifest.source_blend_sha256.slice(0, 16) }}…</span>
-              <span class="meta-label">空间尺寸</span>
-              <span class="meta-val">
-                {{ manifest.bounds.size[0].toFixed(1) }} × {{ manifest.bounds.size[2].toFixed(1) }} ×
-                {{ manifest.bounds.size[1].toFixed(1) }} m
-              </span>
-              <span class="meta-label">漫游碰撞盒</span>
-              <span class="meta-val">
-                [{{ manifest.nav.walk_bounds_min[0].toFixed(1) }}..{{ manifest.nav.walk_bounds_max[0].toFixed(1) }},
-                {{ manifest.nav.walk_bounds_min[2].toFixed(1) }}..{{ manifest.nav.walk_bounds_max[2].toFixed(1) }}] m
-              </span>
-            </div>
-          </section>
+      <aside class="viewer-inspector" :class="{ collapsed: inspectorCollapsed }" data-testid="viewer-inspector">
+        <div class="inspector-rail" role="tablist" aria-label="检视面板">
+          <button type="button" :class="{ on: inspectorTab === 'cam' && !inspectorCollapsed }" data-testid="tab-cam" @click="openInspector('cam')">机位</button>
+          <button type="button" :class="{ on: inspectorTab === 'cast' && !inspectorCollapsed }" :disabled="!hasCast" data-testid="tab-cast" @click="openInspector('cast')">人物</button>
+          <button type="button" :class="{ on: inspectorTab === 'light' && !inspectorCollapsed }" data-testid="tab-light" @click="openInspector('light')">灯光</button>
+          <button type="button" :class="{ on: inspectorTab === 'layer' && !inspectorCollapsed }" data-testid="tab-layer" @click="openInspector('layer')">图层</button>
+          <button type="button" :class="{ on: inspectorTab === 'shot' && !inspectorCollapsed }" data-testid="tab-shot" @click="openInspector('shot')">截图</button>
+          <button type="button" :class="{ on: inspectorTab === 'info' && !inspectorCollapsed }" data-testid="tab-info" @click="openInspector('info')">信息</button>
+          <button type="button" class="rail-collapse" :title="inspectorCollapsed ? '展开面板' : '收起面板'" data-testid="btn-collapse-inspector" @click="inspectorCollapsed = !inspectorCollapsed">
+            {{ inspectorCollapsed ? '«' : '»' }}
+          </button>
+        </div>
 
-          <!-- Blender Cameras -->
-          <section class="inspector-section">
-            <div class="section-header">
-              <span class="section-title">Blender 机位 ({{ manifest.cameras.length }})</span>
-              <span class="badge-mono">16:9 安全框</span>
-            </div>
-
-            <div class="camera-filter-tabs">
+        <div v-if="manifest && !inspectorCollapsed" class="inspector-pane">
+          <template v-if="inspectorTab === 'cam'">
+            <div class="pane-title">机位 <span class="badge-mono">{{ manifest.cameras.length }}</span></div>
+            <div class="pane-grid" data-testid="camera-list">
               <button
-                type="button"
-                class="vf-btn"
-                :class="{ primary: cameraTab === 'production' }"
-                data-testid="tab-production-cameras"
-                @click="cameraTab = 'production'"
-              >
-                实拍机位
-              </button>
-              <button
-                type="button"
-                class="vf-btn"
-                :class="{ primary: cameraTab === 'overview' }"
-                data-testid="tab-overview-cameras"
-                @click="cameraTab = 'overview'"
-              >
-                环视与验光
-              </button>
-            </div>
-
-            <div class="camera-list" data-testid="camera-list">
-              <button
-                v-for="cam in filteredCameras"
+                v-for="cam in panelCameras"
                 :key="cam.id"
                 type="button"
-                class="camera-card"
-                :class="{ active: activeCameraId === cam.id && browseMode === 'camera' }"
-                :data-testid="`camera-card-${cam.id}`"
+                class="film-frame"
+                :class="{ on: activeCameraId === cam.id && browseMode === 'camera' }"
+                :title="cam.label"
                 @click="selectCamera(cam)"
               >
-                <div class="camera-card-top">
-                  <span class="camera-id">{{ cam.id }} · {{ cam.blender_name }}</span>
-                  <span v-if="cam.shot_ref" class="badge-mono">{{ cam.shot_ref }}</span>
-                </div>
-                <div class="camera-label">{{ cam.label }}</div>
-                <div class="camera-optics">
-                  <template v-if="cam.projection === 'ORTHO'">
-                    ORTHO · Scale {{ (cam.ortho_scale || 24).toFixed(1) }}m
-                  </template>
-                  <template v-else>
-                    {{ cam.focal_length_mm }}mm · FOV-Y {{ cam.fov_y_deg.toFixed(2) }}°
-                  </template>
-                  <template v-if="cam.frame_range">
-                    · Fra {{ cam.frame_range[0] }}–{{ cam.frame_range[1] }}
-                  </template>
-                </div>
+                <img v-if="cam.thumbnail && cameraThumbUrls[cam.thumbnail]" :src="cameraThumbUrls[cam.thumbnail]" alt="">
+                <span>{{ cam.id }}</span>
               </button>
             </div>
-          </section>
+            <div v-if="activeCamera" class="pane-row">
+              <span>{{ activeCamera.label }}<small>
+                <template v-if="activeCamera.projection === 'ORTHO'">ORTHO · Scale {{ (activeCamera.ortho_scale || 24).toFixed(1) }}m</template>
+                <template v-else>{{ activeCamera.focal_length_mm }}mm · FOV-Y {{ activeCamera.fov_y_deg.toFixed(2) }}°</template>
+                <template v-if="activeCamera.shot_ref"> · {{ activeCamera.shot_ref }}</template>
+              </small></span>
+            </div>
+            <div class="pane-pager">
+              <button type="button" class="vf-btn" :disabled="panelCamPage <= 0" @click="panelCamPage--">上一页</button>
+              <span>{{ Math.min(panelCamPage, panelCamPageCount - 1) + 1 }}/{{ panelCamPageCount }}</span>
+              <button type="button" class="vf-btn" :disabled="panelCamPage >= panelCamPageCount - 1" @click="panelCamPage++">下一页</button>
+            </div>
+          </template>
 
-          <!-- Clean Screenshots & Host Lightbox -->
-          <section class="inspector-section">
-            <div class="section-header">
-              <span class="section-title">当前会话截图 ({{ captures.length }})</span>
-              <span class="badge-mono">1920×1080 PNG</span>
+          <template v-else-if="inspectorTab === 'cast'">
+            <div class="pane-title">登场人物 <span class="badge-mono">{{ manifest.cast.length }}</span></div>
+            <div v-for="member in manifest.cast.slice(0, 8)" :key="member.node_prefix" class="pane-row">
+              <span>{{ member.label }}<small>{{ member.wardrobe_label || member.node_prefix }}</small></span>
             </div>
-            <div v-if="captures.length === 0" class="state-desc" style="margin: 0">
-              点击顶部「纯净截图 1080p」导出无 HUD 干净画面，并自动唤起 Studio 宿主全局灯箱。
+            <p class="pane-note">“人物”开关隐藏全部 ACTOR_ 替身，用于同机位对比空景。</p>
+          </template>
+
+          <template v-else-if="inspectorTab === 'light'">
+            <div class="pane-title">灯光预设</div>
+            <button
+              v-for="preset in manifest.lighting_presets.slice(0, 8)"
+              :key="preset.id"
+              type="button"
+              class="pane-row selectable"
+              :class="{ on: activePresetId === preset.id }"
+              :data-testid="`preset-${preset.id}`"
+              @click="activePresetId = preset.id"
+            >
+              <span>{{ preset.label }}</span>
+            </button>
+          </template>
+
+          <template v-else-if="inspectorTab === 'layer'">
+            <div class="pane-title">图层</div>
+            <div class="pane-row"><span>场景与道具</span><span class="badge-mono accent">显示</span></div>
+            <div class="pane-row">
+              <span>ACTOR_ 人物替身</span>
+              <span class="badge-mono" :class="{ accent: hasCast && castVisible }">{{ hasCast ? (castVisible ? '显示' : '隐藏') : '无' }}</span>
             </div>
-            <div v-else class="capture-list" data-testid="capture-list">
-              <div v-for="shot in captures" :key="shot.id" class="capture-item">
-                <img
-                  :src="shot.dataUrl"
-                  :alt="shot.title"
-                  class="capture-thumb"
-                  @click="openInHostLightbox(shot)"
-                >
-                <div style="flex: 1; min-width: 0">
-                  <div style="font-size: 12px; font-weight: 600">{{ shot.cameraId }} · {{ shot.presetId }}</div>
-                  <div class="camera-optics">{{ shot.createdAt }}</div>
-                </div>
-                <button type="button" class="vf-btn" @click="downloadCapture(shot)">
-                  下载
-                </button>
-              </div>
+            <div class="pane-row"><span>机位隐藏对象</span><span class="badge-mono">{{ activeCamera?.hide_objects?.length || 0 }}</span></div>
+          </template>
+
+          <template v-else-if="inspectorTab === 'shot'">
+            <div class="pane-title">本次截图 <span class="badge-mono">{{ captures.length }}</span></div>
+            <p v-if="captures.length === 0" class="pane-note">点顶栏“截图”导出无界面画面；点缩略图在宿主灯箱放大。</p>
+            <div v-else class="pane-grid" data-testid="capture-list">
+              <button
+                v-for="shot in captures.slice(0, 6)"
+                :key="shot.id"
+                type="button"
+                class="film-frame"
+                :title="shot.title"
+                @click="openInHostLightbox(shot)"
+              >
+                <img :src="shot.dataUrl" :alt="shot.title">
+                <span>{{ shot.cameraId }}</span>
+              </button>
             </div>
-          </section>
-        </template>
+            <button v-if="captures.length" type="button" class="vf-btn" @click="downloadCapture(captures[0])">下载最新截图</button>
+          </template>
+
+          <template v-else>
+            <div class="pane-title">片场信息</div>
+            <dl class="meta-grid">
+              <dt class="meta-label">片场标识</dt><dd class="meta-val">{{ manifest.set_id }}</dd>
+              <dt class="meta-label">源工程哈希</dt><dd class="meta-val">{{ manifest.source_blend_sha256.slice(0, 16) }}…</dd>
+              <dt class="meta-label">来源</dt><dd class="meta-val">{{ sourceBadgeText }}</dd>
+              <dt class="meta-label">空间尺寸</dt>
+              <dd class="meta-val">{{ manifest.bounds.size[0].toFixed(1) }} × {{ manifest.bounds.size[2].toFixed(1) }} × {{ manifest.bounds.size[1].toFixed(1) }} m</dd>
+              <dt class="meta-label">渲染</dt>
+              <dd class="meta-val" data-testid="renderer-backend">{{ metrics.backend }}{{ metrics.fallbackActive ? ' (Fallback)' : '' }} · {{ metrics.fps }} fps</dd>
+              <dt class="meta-label">几何</dt><dd class="meta-val">{{ metrics.nodes }} 节点 · {{ metrics.triangles.toLocaleString() }} 三角面</dd>
+              <dt class="meta-label">首屏</dt><dd class="meta-val">{{ firstScreenTtiMs }} ms</dd>
+            </dl>
+          </template>
+        </div>
       </aside>
     </div>
   </div>

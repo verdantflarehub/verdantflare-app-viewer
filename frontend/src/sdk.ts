@@ -61,6 +61,8 @@ export interface AppSDK {
 export interface DashboardHost {
   ready(): void
   resize(height: number): void
+  /** AppDashboard contract §3: optional on newer hosts; old hosts keep document layout. */
+  setLayout?(mode: 'document' | 'fill'): void
   getScroll?(): number
   restoreScroll?(top: number): void
 }

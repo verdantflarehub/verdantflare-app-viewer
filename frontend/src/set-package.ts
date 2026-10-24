@@ -59,8 +59,37 @@ export interface SetFileChecksum {
   mime: string
 }
 
+export type SetPackageKind = 'world_empty' | 'project_state' | 'setup'
+
+export interface SetLineageSegment {
+  label: string
+  /** World asset UUID (world_asset) or Project UUID (project_scene). */
+  id?: string
+  /** World asset version UUID or Project revision UUID. */
+  version_id?: string
+  material_key?: string
+  state_key?: string
+  setup_key?: string
+}
+
+export interface SetLineage {
+  world_asset?: SetLineageSegment
+  project_scene?: SetLineageSegment
+  setup?: SetLineageSegment
+}
+
+export interface SetCastMember {
+  node_prefix: string
+  character_key: string
+  label: string
+  wardrobe_label: string
+}
+
 export interface SetPackageManifest {
-  schema_version: '1.0'
+  schema_version: '1.0' | '1.1'
+  kind: SetPackageKind
+  lineage: SetLineage
+  cast: SetCastMember[]
   set_id: string
   title: string
   source_project_slug: string
@@ -142,8 +171,12 @@ export function validateSetManifest(raw: unknown): SetPackageManifest {
     throw new Error('set.json 必须为 JSON 对象。')
   }
   const doc = raw as Record<string, unknown>
-  if (doc.schema_version !== '1.0') {
+  if (doc.schema_version !== '1.0' && doc.schema_version !== '1.1') {
     throw new Error(`不支持的片场包 schema_version: ${String(doc.schema_version)}`)
+  }
+  const schemaVersion = doc.schema_version as '1.0' | '1.1'
+  if (schemaVersion === '1.0' && (doc.kind !== undefined || doc.lineage !== undefined || doc.cast !== undefined)) {
+    throw new Error('schema_version 1.0 的片场包不得包含 v1.1 字段 kind / lineage / cast。')
   }
 
   const setId = String(doc.set_id || doc.package_id || '').trim()
@@ -464,8 +497,13 @@ export function validateSetManifest(raw: unknown): SetPackageManifest {
       ? sourceObj.blend_sha256
       : normFiles['scene.glb'].sha256
 
+  const layering = normalizeLayering(doc)
+
   return {
-    schema_version: '1.0',
+    schema_version: schemaVersion,
+    kind: layering.kind,
+    lineage: layering.lineage,
+    cast: layering.cast,
     set_id: setId,
     title,
     source_project_slug: String(
@@ -484,6 +522,68 @@ export function validateSetManifest(raw: unknown): SetPackageManifest {
     lighting_presets: normPresets,
     files: normFiles,
   }
+}
+
+const KIND_VALUES: SetPackageKind[] = ['world_empty', 'project_state', 'setup']
+const ACTOR_PREFIX_RE = /^ACTOR_[A-Za-z0-9_]{1,60}$/
+
+function lineageSegment(raw: unknown, idKey: string, versionKey: string): SetLineageSegment | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const s = raw as Record<string, unknown>
+  const label = typeof s.label === 'string' ? s.label.trim() : ''
+  if (!label) throw new Error('set.json lineage 段缺少 label。')
+  const seg: SetLineageSegment = { label }
+  if (typeof s[idKey] === 'string' && UUID_V7_RE.test(s[idKey] as string)) seg.id = s[idKey] as string
+  if (typeof s[versionKey] === 'string' && UUID_V7_RE.test(s[versionKey] as string)) seg.version_id = s[versionKey] as string
+  for (const k of ['material_key', 'state_key', 'setup_key'] as const) {
+    if (typeof s[k] === 'string' && /^[A-Za-z0-9_-]+$/.test(s[k] as string)) seg[k] = s[k] as string
+  }
+  return seg
+}
+
+/** Set Package v1.1 §7: package kind, lineage chain and cast. v1.0 packages default to a setup without cast. */
+export function normalizeLayering(doc: Record<string, unknown>): { kind: SetPackageKind; lineage: SetLineage; cast: SetCastMember[] } {
+  const kind = doc.kind === undefined ? 'setup' : (doc.kind as SetPackageKind)
+  if (!KIND_VALUES.includes(kind)) throw new Error(`set.json kind 无效：${String(doc.kind)}`)
+  const rawLineage = (doc.lineage && typeof doc.lineage === 'object' ? doc.lineage : {}) as Record<string, unknown>
+  const lineage: SetLineage = {}
+  const world = lineageSegment(rawLineage.world_asset, 'asset_id', 'version_id')
+  const scene = lineageSegment(rawLineage.project_scene, 'project_id', 'revision_id')
+  const setup = lineageSegment(rawLineage.setup, 'setup_key', 'setup_key')
+  if (world) lineage.world_asset = world
+  if (scene) lineage.project_scene = scene
+  if (setup) lineage.setup = setup
+  if (kind === 'world_empty' && (scene || setup)) throw new Error('world_empty 片场包的 lineage 只能包含 world_asset。')
+  if (kind === 'project_state' && setup) throw new Error('project_state 片场包的 lineage 不得包含 setup。')
+  if (kind === 'setup' && doc.lineage !== undefined && (!scene || !setup)) {
+    throw new Error('setup 片场包的 lineage 必须包含 project_scene 与 setup。')
+  }
+
+  const cast: SetCastMember[] = []
+  if (doc.cast !== undefined) {
+    if (kind !== 'setup') throw new Error('EMPTY_SET_HAS_ACTORS：空景片场包不得包含 cast。')
+    if (!Array.isArray(doc.cast)) throw new Error('set.json cast 必须为数组。')
+    const seen = new Set<string>()
+    for (const item of doc.cast) {
+      const c = (item || {}) as Record<string, unknown>
+      const prefix = String(c.node_prefix || '')
+      if (!ACTOR_PREFIX_RE.test(prefix) || seen.has(prefix)) throw new Error(`set.json cast.node_prefix 无效或重复：${prefix}`)
+      seen.add(prefix)
+      cast.push({
+        node_prefix: prefix,
+        character_key: String(c.character_key || ''),
+        label: String(c.label || prefix.slice(6)),
+        wardrobe_label: typeof c.wardrobe_label === 'string' ? c.wardrobe_label : '',
+      })
+    }
+  }
+  if (kind !== 'setup') {
+    const groups = Array.isArray(doc.object_groups) ? (doc.object_groups as Array<Record<string, unknown>>) : []
+    if (groups.some(g => typeof g?.prefix === 'string' && (g.prefix as string).startsWith('ACTOR_'))) {
+      throw new Error('EMPTY_SET_HAS_ACTORS：空景片场包不得包含 ACTOR_ 对象分组。')
+    }
+  }
+  return { kind, lineage, cast }
 }
 
 export function parseViewerRoute(routePath: string, browserHash = ''): ViewerRouteTarget {
